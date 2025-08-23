@@ -3,6 +3,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 from typing import Optional
+import json
 
 from dotenv import load_dotenv
 from telegram import (
@@ -35,6 +36,39 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("time_to_work_bot")
+
+STATE_PATH = os.path.join(os.path.dirname(__file__), "schedule_state.json")
+
+
+def _load_state() -> dict:
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning("Failed to load state: %s", e)
+        return {}
+
+
+def _save_state_for_chat(chat_id: int, work_m: int, rest_m: int) -> None:
+    data = _load_state()
+    data[str(chat_id)] = {"work": int(work_m), "rest": int(rest_m)}
+    tmp_path = STATE_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp_path, STATE_PATH)
+
+
+def _get_saved_durations(chat_id: int) -> Optional[tuple[int, int]]:
+    data = _load_state()
+    entry = data.get(str(chat_id))
+    if isinstance(entry, dict) and "work" in entry and "rest" in entry:
+        try:
+            return int(entry["work"]), int(entry["rest"])
+        except Exception:
+            return None
+    return None
 
 
 def _get_choice_keyboard() -> ReplyKeyboardMarkup:
@@ -126,6 +160,7 @@ async def rest_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.chat_data["work_rest_task"] = task
     context.chat_data["last_work_m"] = work_m
     context.chat_data["last_rest_m"] = rest_m
+    _save_state_for_chat(chat_id, work_m, rest_m)
 
     # Return to end conversation; controls are via inline button now
     return ConversationHandler.END
@@ -222,8 +257,11 @@ async def resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     rest_m = context.chat_data.get("last_rest_m")
 
     if not isinstance(work_m, int) or not isinstance(rest_m, int):
-        await query.edit_message_text("Нет сохранённых настроек. Запустите заново через /start.")
-        return
+        saved = _get_saved_durations(chat_id)
+        if saved is None:
+            await query.edit_message_text("Нет сохранённых настроек. Запустите заново через /start.")
+            return
+        work_m, rest_m = saved
 
     # Ensure any existing schedule is cancelled (safety)
     await _cancel_any_running_schedule(context)
@@ -233,6 +271,28 @@ async def resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     context.chat_data["work_rest_task"] = task
 
     await query.edit_message_text(f"Расписание возобновлено: работа {work_m} мин, отдых {rest_m} мин.")
+
+
+async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    work_m = context.chat_data.get("last_work_m")
+    rest_m = context.chat_data.get("last_rest_m")
+
+    if not isinstance(work_m, int) or not isinstance(rest_m, int):
+        saved = _get_saved_durations(chat_id)
+        if saved is None:
+            await update.message.reply_text("Нет сохранённых настроек. Запустите заново через /start.")
+            return
+        work_m, rest_m = saved
+
+    await _cancel_any_running_schedule(context)
+
+    task = asyncio.create_task(_work_rest_loop(context, chat_id, work_m, rest_m))
+    context.chat_data["work_rest_task"] = task
+    context.chat_data["last_work_m"] = work_m
+    context.chat_data["last_rest_m"] = rest_m
+
+    await update.message.reply_text(f"Расписание возобновлено: работа {work_m} мин, отдых {rest_m} мин.")
 
 
 async def _cancel_any_running_schedule(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -311,6 +371,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(stop_button, pattern=f"^{STOP_SCHEDULE_CB}$"))
     app.add_handler(CallbackQueryHandler(resume_button, pattern=f"^{RESUME_SCHEDULE_CB}$"))
     app.add_handler(CommandHandler("stop", stop_command))
+    app.add_handler(CommandHandler("resume", resume_command))
     return app
 
 
