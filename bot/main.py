@@ -28,6 +28,7 @@ CHOOSING_SCHEDULE, WORK_DURATION, REST_DURATION, HOUSEHOLD_TIME, HOUSEHOLD_TEXT 
 
 # Callback data
 STOP_SCHEDULE_CB = "stop_schedule"
+RESUME_SCHEDULE_CB = "resume_schedule"
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
@@ -45,6 +46,12 @@ def _get_choice_keyboard() -> ReplyKeyboardMarkup:
 def _get_stop_inline_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(text="Остановить расписание", callback_data=STOP_SCHEDULE_CB)]
+    ])
+
+
+def _get_resume_inline_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(text="Возобновить расписание", callback_data=RESUME_SCHEDULE_CB)]
     ])
 
 
@@ -117,6 +124,8 @@ async def rest_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     chat_id = update.effective_chat.id
     task = asyncio.create_task(_work_rest_loop(context, chat_id, work_m, rest_m))
     context.chat_data["work_rest_task"] = task
+    context.chat_data["last_work_m"] = work_m
+    context.chat_data["last_rest_m"] = rest_m
 
     # Return to end conversation; controls are via inline button now
     return ConversationHandler.END
@@ -180,6 +189,12 @@ async def stop_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         cancelled = await _cancel_any_running_schedule(context)
         if cancelled:
             await query.edit_message_text("Расписание остановлено.")
+            chat_id = query.message.chat_id
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Хотите возобновить?",
+                reply_markup=_get_resume_inline_keyboard(),
+            )
         else:
             await query.edit_message_text("Нет активного расписания.")
 
@@ -187,9 +202,37 @@ async def stop_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cancelled = await _cancel_any_running_schedule(context)
     if cancelled:
-        await update.message.reply_text("Расписание остановлено.")
+        await update.message.reply_text(
+            "Расписание остановлено. Хотите возобновить?",
+            reply_markup=_get_resume_inline_keyboard(),
+        )
     else:
         await update.message.reply_text("Нет активного расписания.")
+
+
+async def resume_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data != RESUME_SCHEDULE_CB:
+        return
+
+    chat_id = query.message.chat_id
+    work_m = context.chat_data.get("last_work_m")
+    rest_m = context.chat_data.get("last_rest_m")
+
+    if not isinstance(work_m, int) or not isinstance(rest_m, int):
+        await query.edit_message_text("Нет сохранённых настроек. Запустите заново через /start.")
+        return
+
+    # Ensure any existing schedule is cancelled (safety)
+    await _cancel_any_running_schedule(context)
+
+    # Start loop again
+    task = asyncio.create_task(_work_rest_loop(context, chat_id, work_m, rest_m))
+    context.chat_data["work_rest_task"] = task
+
+    await query.edit_message_text(f"Расписание возобновлено: работа {work_m} мин, отдых {rest_m} мин.")
 
 
 async def _cancel_any_running_schedule(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -266,6 +309,7 @@ def build_application():
 
     app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(stop_button, pattern=f"^{STOP_SCHEDULE_CB}$"))
+    app.add_handler(CallbackQueryHandler(resume_button, pattern=f"^{RESUME_SCHEDULE_CB}$"))
     app.add_handler(CommandHandler("stop", stop_command))
     return app
 
