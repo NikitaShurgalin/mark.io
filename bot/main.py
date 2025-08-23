@@ -162,6 +162,13 @@ async def rest_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.chat_data["last_rest_m"] = rest_m
     _save_state_for_chat(chat_id, work_m, rest_m)
 
+    # Send immediate first phase for clarity
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Пора работать!",
+        reply_markup=_get_stop_inline_keyboard(),
+    )
+
     # Return to end conversation; controls are via inline button now
     return ConversationHandler.END
 
@@ -190,6 +197,16 @@ async def household_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return HOUSEHOLD_TEXT
 
 
+async def _household_job_cb(ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    job = getattr(ctx, "job", None)
+    chat_id = getattr(job, "chat_id", None)
+    text = getattr(job, "data", None)
+    if chat_id is None or not text:
+        logger.warning("Household job missing chat_id or text: %s", job)
+        return
+    await ctx.bot.send_message(chat_id=chat_id, text=text)
+
+
 async def household_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     text = (update.message.text or "").strip()
     if not text:
@@ -199,13 +216,9 @@ async def household_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     delay_seconds = int(context.user_data.get("household_delay", 0))
     chat_id = update.effective_chat.id
 
-    # Schedule one-time job via JobQueue
+    # Schedule one-time job via JobQueue with explicit chat_id and data
     when = timedelta(seconds=delay_seconds) if delay_seconds > 0 else timedelta(seconds=0)
-
-    async def _send_household_reminder(ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        await ctx.bot.send_message(chat_id=chat_id, text=text)
-
-    context.job_queue.run_once(lambda c: asyncio.create_task(_send_household_reminder(c)), when=when)
+    context.job_queue.run_once(_household_job_cb, when=when, chat_id=chat_id, data=text)
 
     # Inform user
     minutes = delay_seconds // 60
@@ -340,6 +353,10 @@ def _get_token() -> str:
     return token
 
 
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error: update=%s", update)
+
+
 def build_application():
     token = _get_token()
     app = ApplicationBuilder().token(token).build()
@@ -372,6 +389,7 @@ def build_application():
     app.add_handler(CallbackQueryHandler(resume_button, pattern=f"^{RESUME_SCHEDULE_CB}$"))
     app.add_handler(CommandHandler("stop", stop_command))
     app.add_handler(CommandHandler("resume", resume_command))
+    app.add_error_handler(_error_handler)
     return app
 
 
